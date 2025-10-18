@@ -1,146 +1,159 @@
 """
 File: analyzer.py
-Purpose: Robust AI-powered text & PDF analyzer for Innoventors backend (v3).
-Now guarantees detailed, structured JSON output for each Test Case or Scenario.
+Purpose: AI-powered text & PDF analyzer for Innoventors backend (Azure OpenAI).
 """
 
 import os
 import re
-import json
 import time
+import json
 from typing import List, Dict
 from PyPDF2 import PdfReader
 from openai import AzureOpenAI
 from dotenv import load_dotenv
 
-# Debug flag to print PDF splits
-DEBUG_MODE = True
-
-
+# ------------------------------------------------------
+# Environment Setup
+# ------------------------------------------------------
 load_dotenv()
 
-# ------------------------------------------------------------
-# Azure OpenAI client
-# ------------------------------------------------------------
 client = AzureOpenAI(
     azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
     api_key=os.getenv("AZURE_OPENAI_API_KEY"),
     api_version=os.getenv("AZURE_OPENAI_API_VERSION")
 )
 
-# ------------------------------------------------------------
-# PDF Utilities
-# ------------------------------------------------------------
+# Optional sanity check
+for var in ["AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_API_VERSION"]:
+    if not os.getenv(var):
+        print(f"⚠️ Warning: Missing environment variable {var}")
+
+# ------------------------------------------------------
+# Utility: Extract text from PDF
+# ------------------------------------------------------
 def extract_text_from_pdf(file_path: str) -> str:
-    """Extract all text from a PDF, page by page."""
+    """Safely extract text from a PDF file."""
     text = ""
-    reader = PdfReader(file_path)
-    for page in reader.pages:
-        text += (page.extract_text() or "") + "\n"
+    try:
+        reader = PdfReader(file_path)
+        for page in reader.pages:
+            text += (page.extract_text() or "") + "\n"
+    except Exception as e:
+        print(f"⚠️ PDF extraction failed: {e}")
     return text.strip()
 
-# ------------------------------------------------------------
-# Section Splitter
-# ------------------------------------------------------------
-_SECTION_PATTERN = re.compile(
-    r"(?P<title>(?:Test\s*Case|Scenario)\s*\d+[^\n]*)\s*(?P<body>[\s\S]*?)(?=(?:Test\s*Case|Scenario)\s*\d+|\Z)",
-    flags=re.IGNORECASE
-)
+# ------------------------------------------------------
+# Text Cleaning Utilities
+# ------------------------------------------------------
+def clean_text(text: str) -> str:
+    """Remove weird mid-word spacing and normalize spaces."""
+    if not text:
+        return ""
+    text = re.sub(r"(?<=\w)\s(?=\w)", "", text)  # remove intra-word gaps
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
+def normalize_title(title: str) -> str:
+    """
+    Clean and properly format titles like 'test case 1 (email escalated from l1 support)'.
+    """
+    if not title:
+        return ""
+    title = clean_text(title)
+
+    # Insert missing spaces like: Case1 → Case 1, (Email→ (Email
+    title = re.sub(r"(?<=Case)(\d)", r" \1", title)
+    title = re.sub(r"(?<=\d)(?=\()", " ", title)
+
+    # Capitalize words but preserve acronyms (L1, PDF)
+    words = title.split()
+    result = []
+    for w in words:
+        if len(w) > 1 and w.isupper():  # preserve acronyms
+            result.append(w)
+        else:
+            result.append(w.capitalize())
+    return " ".join(result)
+
+
+# ------------------------------------------------------
+# Split multi-incident PDFs
+# ------------------------------------------------------
 def _split_sections(content: str) -> List[Dict[str, str]]:
     """
-    Split content into sections based on 'Test Case' or 'Scenario' markers.
-    Always returns at least one section.
+    Split text into sections like [{"title": "...", "body": "..."}].
+    Recognizes headings like "Test Case 1" or "Scenario 2".
     """
-    sections = [
-        {"title": m.group("title").strip(), "body": (m.group("body") or "").strip()}
-        for m in _SECTION_PATTERN.finditer(content)
-    ]
-    if not sections:
-        sections = [{"title": "Incident 1", "body": content.strip()}]
+    lines = content.splitlines()
+    sections = []
+    current = {"title": "", "body": ""}
 
-    for s in sections:
-        if not s["body"] or len(s["body"]) < 10:
-            s["body"] = (s["body"] or "") + "\n(Note: Minimal text detected. Parsed from PDF.)"
+    for line in lines:
+        if re.match(r"(?i)(test\s*case\s*\d+|scenario\s*\d+)", line.strip()):
+            if current["title"] or current["body"]:
+                sections.append(current)
+                current = {"title": "", "body": ""}
+            current["title"] = line.strip()
+        else:
+            current["body"] += line.strip() + " "
 
-    if DEBUG_MODE:
-        print("\n🧩 === PDF SPLIT DEBUG ===")
-        for idx, s in enumerate(sections, 1):
-            print(f"\nCase {idx}: {s['title']}\n{'-'*60}")
-            print(s["body"][:1000])  # Print up to 1000 chars for clarity
-            print("\n")
+    if current["title"] or current["body"]:
+        sections.append(current)
+
+    # Clean up each section
+    for sec in sections:
+        sec["title"] = normalize_title(sec["title"])
+        sec["body"] = clean_text(sec["body"])
 
     return sections
 
-# ------------------------------------------------------------
-# Structured JSON Parser Helper
-# ------------------------------------------------------------
-def _extract_between(text: str, start_pat: str, end_pat: str) -> str:
-    s = re.search(start_pat, text, flags=re.IGNORECASE)
-    if not s:
-        return None
-    start = s.end()
-    e = re.search(end_pat, text[start:], flags=re.IGNORECASE)
-    if not e:
-        return text[start:]
-    return text[start:start + e.start()]
-
-def _coerce_to_fields(free_text: str) -> dict:
-    """Extract structured fields from AI free-text (fallback if JSON fails)."""
+# ------------------------------------------------------
+# Optional Field Coercion (placeholder for backend use)
+# ------------------------------------------------------
+def _coerce_to_fields(ai_json: str) -> dict:
+    """
+    Ensure AI output has expected fields even if model response is partial.
+    """
     try:
-        maybe = json.loads(free_text)
-        if isinstance(maybe, dict):
-            return {
-                "root_cause": maybe.get("root_cause"),
-                "summary": maybe.get("summary"),
-                "recommendation": maybe.get("recommendation"),
-                "category": maybe.get("category"),
-                "severity": maybe.get("severity"),
-            }
+        data = json.loads(ai_json)
+        return {
+            "summary": data.get("summary", "N/A"),
+            "root_cause": data.get("root_cause", "N/A"),
+            "recommendation": data.get("recommendation", "N/A"),
+            "category": data.get("category", "Uncategorized"),
+            "severity": data.get("severity", "Unknown"),
+        }
     except Exception:
-        pass
+        return {
+            "summary": "Invalid AI output",
+            "root_cause": "Parsing failed",
+            "recommendation": "Manual review required",
+            "category": "Error",
+            "severity": "Unknown",
+        }
 
-    rc = _extract_between(free_text, r"(Root\s*Cause[:\-])", r"(Summary|Recommendation|Severity|Category|$)")
-    sm = _extract_between(free_text, r"(Summary[:\-])", r"(Recommendation|Severity|Category|$)")
-    rec = _extract_between(free_text, r"(Recommendation[:\-])", r"(Severity|Category|$)")
-    sev = _extract_between(free_text, r"(Severity[:\-])", r"(Category|$)")
-    cat = _extract_between(free_text, r"(Category[:\-])", r"$")
-
-    def clean(x): return x.strip(" \n-:") if x else None
-
-    if not any([rc, sm, rec, sev, cat]):
-        return {"root_cause": None, "summary": free_text.strip(), "recommendation": None, "category": None, "severity": None}
-
-    return {
-        "root_cause": clean(rc),
-        "summary": clean(sm),
-        "recommendation": clean(rec),
-        "category": clean(cat),
-        "severity": clean(sev)
-    }
-
-# ------------------------------------------------------------
-# AI Analysis Logic (robust)
-# ------------------------------------------------------------
+# ------------------------------------------------------
+# AI Analysis Core
+# ------------------------------------------------------
 def analyze_text(content: str, retries: int = 2, delay: int = 2) -> dict:
     """
-    Analyze each section using Azure OpenAI and return detailed JSON results.
-    Retries automatically if the model returns invalid or empty output.
+    Analyze each section using Azure OpenAI and return structured JSON results.
+    Retries automatically if model output is invalid.
     """
     deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT")
     sections = _split_sections(content)
     results = []
 
     for idx, sec in enumerate(sections, start=1):
-        title = sec["title"]
+        title = sec["title"] or f"Incident {idx}"
         body = sec["body"]
 
-        base_prompt = f"""
+        prompt = f"""
         You are a senior product operations and incident management analyst.
         Analyze the following incident and return a detailed root cause analysis
         STRICTLY in valid JSON with the following keys:
-        - root_cause
         - summary
+        - root_cause
         - recommendation
         - category
         - severity (Low / Medium / High)
@@ -157,22 +170,32 @@ def analyze_text(content: str, retries: int = 2, delay: int = 2) -> dict:
                 resp = client.chat.completions.create(
                     model=deployment,
                     messages=[
-                        {"role": "system", "content": "You are an expert RCA analyst. Always reply in JSON."},
-                        {"role": "user", "content": base_prompt.strip()},
+                        {"role": "system", "content": "You are an expert RCA analyst. Always reply in valid JSON."},
+                        {"role": "user", "content": prompt.strip()},
                     ],
                     temperature=0.2,
                 )
                 response_text = resp.choices[0].message.content.strip()
-                # Try parsing JSON to verify validity
-                json.loads(response_text)
-                break  # valid JSON → break retry loop
-            except Exception:
+                json.loads(response_text)  # Validate JSON
+                break
+            except Exception as e:
+                print(f"⚠️ Attempt {attempt} failed: {e}")
                 if attempt < retries:
                     time.sleep(delay)
-                    base_prompt += "\n\n⚠️ Please output valid JSON only."
+                    prompt += "\n\n⚠️ Please output valid JSON only."
                 else:
-                    response_text = f'{{"root_cause": "AI parsing failed after {retries} attempts.", "summary": "{body[:150]}", "recommendation": "Manual review required.", "category": "Error", "severity": "Unknown"}}'
+                    response_text = json.dumps({
+                        "summary": body[:150],
+                        "root_cause": f"AI parsing failed after {retries} attempts.",
+                        "recommendation": "Manual review required.",
+                        "category": "Error",
+                        "severity": "Unknown"
+                    })
 
         results.append({"case": title, "analysis": response_text})
 
-    return {"status": "success", "total_incidents": len(results), "analysis": results}
+    return {
+        "status": "success",
+        "total_incidents": len(results),
+        "analysis": results
+    }

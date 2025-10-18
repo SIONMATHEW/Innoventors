@@ -1,0 +1,7 @@
+[theme]
+base="light"
+primaryColor="#0b5fff"               # Matches your button gradient start (deep blue)
+backgroundColor="#f9fafb"
+secondaryBackgroundColor="#ffffff"   # Card white, consistent with .card background
+textColor="#0b3954"                  # Same as your heading & sidebar palette
+font="Inter"

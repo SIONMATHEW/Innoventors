@@ -133,3 +133,15 @@ async def analyze_file(file: UploadFile = File(...), db: Session = Depends(get_d
         "total_incidents": len(inserted),
         "inserted": inserted
     }
+
+@app.delete("/reset")
+def reset_database(db: Session = Depends(get_db)):
+    """Deletes all records in the database (manual reset)."""
+    try:
+        db.query(models.Analysis).delete()
+    except Exception:
+        pass
+    db.query(models.Incident).delete()
+    db.query(models.File).delete()
+    db.commit()
+    return {"status": "success", "message": "All data cleared successfully"}
