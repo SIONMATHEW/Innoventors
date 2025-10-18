@@ -73,12 +73,12 @@ def get_incidents(db: Session = Depends(get_db)):
 @app.post("/analyze")
 async def analyze_file(file: UploadFile = File(...), db: Session = Depends(get_db)):
     """
-    Analyze uploaded text or PDF, generate AI insights using OpenAI,
-    and store the result in the database.
+    Analyze uploaded text or PDF, generate AI insights using Azure OpenAI,
+    and store the result(s) in the database.
     """
     content = ""
 
-    # Save and read the uploaded file
+    # Save and read uploaded file
     if file.filename.endswith(".pdf"):
         temp_path = f"temp_{file.filename}"
         with open(temp_path, "wb") as temp_file:
@@ -88,22 +88,46 @@ async def analyze_file(file: UploadFile = File(...), db: Session = Depends(get_d
     else:
         content = (await file.read()).decode("utf-8")
 
-    # Run AI analysis (normal OpenAI)
+    # Run AI analysis
     result = analyze_text(content)
 
-    # Store in DB
-    incident = models.Incident(
-        title=file.filename,
-        description=content[:500],
-        root_cause=result["analysis"],
-        recommendation="See AI report"
-    )
-    db.add(incident)
-    db.commit()
-    db.refresh(incident)
-
-    return {
-        "status": "success",
-        "incident_id": incident.id,
-        "ai_result": result
-    }
+    # If analyze_text returned the older single-shape (string), normalize it
+    inserted = []
+    if isinstance(result, dict) and "analysis" in result and isinstance(result["analysis"], list):
+        # Multi-incident path
+        for item in result["analysis"]:
+            case_title = item.get("case", file.filename)
+            analysis_text = item.get("analysis", "")
+            incident = models.Incident(
+                title=case_title,
+                description=content[:500],
+                root_cause=analysis_text,
+                recommendation="See AI-generated report"
+            )
+            db.add(incident)
+            db.commit()
+            db.refresh(incident)
+            inserted.append({"id": incident.id, "case": case_title})
+        return {
+            "status": "success",
+            "total_incidents": len(inserted),
+            "inserted": inserted,
+            "ai_result": result
+        }
+    else:
+        # Single-incident fallback (backwards compatibility)
+        analysis_text = result.get("analysis", "") if isinstance(result, dict) else str(result)
+        incident = models.Incident(
+            title=file.filename,
+            description=content[:500],
+            root_cause=analysis_text,
+            recommendation="See AI-generated report"
+        )
+        db.add(incident)
+        db.commit()
+        db.refresh(incident)
+        return {
+            "status": "success",
+            "incident_id": incident.id,
+            "ai_result": {"analysis": analysis_text}
+        }
